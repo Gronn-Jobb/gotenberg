@@ -224,6 +224,8 @@ func FormDataChromiumPdfOptions(ctx *api.Context) (*api.FormData, PdfOptions) {
 		String("nativePageRanges", &pageRanges, defaultPdfOptions.PageRanges).
 		Content("header.html", &headerTemplate, defaultPdfOptions.HeaderTemplate).
 		Content("footer.html", &footerTemplate, defaultPdfOptions.FooterTemplate).
+		String("headerHTML", &headerTemplate, defaultPdfOptions.HeaderTemplate).
+		String("footerHTML", &footerTemplate, defaultPdfOptions.FooterTemplate).
 		Bool("preferCssPageSize", &preferCssPageSize, defaultPdfOptions.PreferCssPageSize).
 		Bool("generateDocumentOutline", &generateDocumentOutline, defaultPdfOptions.GenerateDocumentOutline).
 		Bool("generateTaggedPdf", &generateTaggedPdf, defaultPdfOptions.GenerateTaggedPdf)
