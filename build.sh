@@ -2,5 +2,4 @@
 
 docker --debug \
   buildx build \
-  -f Dockerfile .
-
+  -f ./Dockerfile .
