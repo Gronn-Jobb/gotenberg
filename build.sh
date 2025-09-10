@@ -5,3 +5,4 @@ docker --debug \
   --no-cache \
   -t gotenberg-dev:local \
   -f ./Dockerfile .
+
