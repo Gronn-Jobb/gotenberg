@@ -1,0 +1,10 @@
+services:
+  server:
+    image: xpanddockerregistry.azurecr.io/gotenberg-dev
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    ports:
+      - ${API_PORT}:${API_PORT}
+    environment:
+      API_PORT: ${API_PORT}
