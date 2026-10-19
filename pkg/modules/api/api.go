@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"sort"
@@ -11,12 +12,9 @@ import (
 	"time"
 
 	"github.com/alexliesenfeld/health"
-	"github.com/dlclark/regexp2"
-	"github.com/labstack/echo/v4"
+	"github.com/dlclark/regexp2/v2"
+	"github.com/labstack/echo/v5"
 	flag "github.com/spf13/pflag"
-	"go.uber.org/multierr"
-	"go.uber.org/zap"
-	"golang.org/x/net/http2"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/gotenberg/gotenberg/v8/pkg/gotenberg"
@@ -29,20 +27,27 @@ func init() {
 // Api is a module that provides an HTTP server. Other modules may add routes,
 // middlewares or health checks.
 type Api struct {
-	port                      int
-	bindIp                    string
-	tlsCertFile               string
-	tlsKeyFile                string
-	startTimeout              time.Duration
-	bodyLimit                 int64
-	timeout                   time.Duration
-	rootPath                  string
-	traceHeader               string
-	basicAuthUsername         string
-	basicAuthPassword         string
-	downloadFromCfg           downloadFromConfig
-	disableHealthCheckLogging bool
-	enableDebugRoute          bool
+	port                             int
+	bindIp                           string
+	tlsCertFile                      string
+	tlsKeyFile                       string
+	startTimeout                     time.Duration
+	bodyLimit                        int64
+	timeout                          time.Duration
+	rootPath                         string
+	correlationIdHeader              string
+	basicAuthUsername                string
+	basicAuthPassword                string
+	oidcEnabled                      bool
+	oidcIssuer                       string
+	oidcAudience                     string
+	oidcJwksUrl                      string
+	downloadFromCfg                  downloadFromConfig
+	disableHealthCheckRouteTelemetry bool
+	disableRootRouteTelemetry        bool
+	disableDebugRouteTelemetry       bool
+	disableVersionRouteTelemetry     bool
+	enableDebugRoute                 bool
 
 	routes              []Route
 	externalMiddlewares []Middleware
@@ -50,15 +55,26 @@ type Api struct {
 	readyFn             []func() error
 	asyncCounters       []AsynchronousCounter
 	fs                  *gotenberg.FileSystem
-	logger              *zap.Logger
+	logger              *slog.Logger
 	srv                 *echo.Echo
+
+	// shutdownCancel triggers the graceful shutdown of the server started by
+	// [echo.StartConfig]. Echo v5 drives shutdown from a context instead of an
+	// Echo.Shutdown method. serveDone closes once that shutdown completed.
+	shutdownCancel context.CancelFunc
+	serveDone      chan struct{}
 }
 
 type downloadFromConfig struct {
-	allowList *regexp2.Regexp
-	denyList  *regexp2.Regexp
-	maxRetry  int
-	disable   bool
+	allowList              []*regexp2.Regexp
+	denyList               []*regexp2.Regexp
+	denyPrivateIPs         bool
+	denyPublicIPs          bool
+	enableEnvironmentProxy bool
+	maxRetry               int
+	maxConcurrency         int
+	maxEntries             int
+	disable                bool
 }
 
 // Router is a module interface that adds routes to the [Api].
@@ -80,9 +96,10 @@ type Route struct {
 	// Optional.
 	IsMultipart bool
 
-	// DisableLogging disables the logging for this route.
+	// DisableTelemetry disables telemetry (logging, tracing, metrics) for
+	// this route.
 	// Optional.
-	DisableLogging bool
+	DisableTelemetry bool
 
 	// Handler is the function that handles the request.
 	// Required.
@@ -122,7 +139,7 @@ const (
 //	middleware := Middleware{
 //	  Handler: func() echo.MiddlewareFunc {
 //	    return func(next echo.HandlerFunc) echo.HandlerFunc {
-//	      return func(c echo.Context) error {
+//	      return func(c *echo.Context) error {
 //	        rootPath := c.Get("rootPath").(string)
 //	        healthURI := fmt.Sprintf("%shealth", rootPath)
 //
@@ -190,14 +207,38 @@ func (a *Api) Descriptor() gotenberg.ModuleDescriptor {
 			fs.Duration("api-timeout", time.Duration(30)*time.Second, "Set the time limit for requests")
 			fs.String("api-body-limit", "", "Set the body limit for multipart/form-data requests - it accepts values like 5MB, 1GB, etc")
 			fs.String("api-root-path", "/", "Set the root path of the API - for service discovery via URL paths")
-			fs.String("api-trace-header", "Gotenberg-Trace", "Set the header name to use for identifying requests")
+			fs.String("api-correlation-id-header", "Gotenberg-Trace", "Set the header name to use for identifying requests")
 			fs.Bool("api-enable-basic-auth", false, "Enable basic authentication - will look for the GOTENBERG_API_BASIC_AUTH_USERNAME and GOTENBERG_API_BASIC_AUTH_PASSWORD environment variables")
-			fs.String("api-download-from-allow-list", "", "Set the allowed URLs for the download from feature using a regular expression")
-			fs.String("api-download-from-deny-list", "", "Set the denied URLs for the download from feature using a regular expression")
+			fs.Bool("api-enable-oidc-auth", false, "Enable OIDC bearer token authentication - mutually exclusive with basic authentication")
+			fs.String("api-oidc-issuer", "", "Set the OIDC issuer URL, e.g. https://tenant.example.com/ - the token 'iss' claim must match")
+			fs.String("api-oidc-audience", "", "Set the expected OIDC audience - the token 'aud' claim must contain it")
+			fs.String("api-oidc-jwks-url", "", "Set the OIDC JWKS URL - discovered from the issuer's well-known configuration when empty")
+			fs.StringSlice("api-download-from-allow-list", []string{}, `Set the allowed URLs for the download from feature using regular expressions - supports multiple values. A match bypasses --api-download-from-deny-private-ips (API_DOWNLOAD_FROM_DENY_PRIVATE_IPS) and --api-download-from-deny-public-ips (API_DOWNLOAD_FROM_DENY_PUBLIC_IPS), so terminate the host or the pattern also matches suffix hosts, for example ^https?://internal\.svc(:|/|$)`)
+			fs.StringSlice("api-download-from-deny-list", []string{}, "Set the denied URLs for the download from feature using regular expressions - supports multiple values")
+			fs.Bool("api-download-from-deny-private-ips", false, "Reject downloadFrom URLs whose host resolves to a non-public IP address (loopback, RFC1918, link-local, unique-local). Enable on deployments that accept untrusted downloadFrom sources to mitigate SSRF against internal services")
+			fs.Bool("api-download-from-deny-public-ips", false, "Reject downloadFrom URLs whose host resolves to a public IP address. Enable on air-gapped or data-governed deployments to prevent downloads from reaching the public internet")
+			fs.Bool("api-download-from-enable-environment-proxy", false, "Route downloadFrom fetches through the proxy defined by the standard HTTP_PROXY, HTTPS_PROXY, and NO_PROXY variables, including credentials")
 			fs.Int("api-download-from-max-retry", 4, "Set the maximum number of retries for the download from feature")
+			fs.Int("api-download-from-max-concurrency", 10, "Set the maximum number of downloadFrom entries fetched concurrently per request - bounds the outbound fan-out. Set to 0 to disable this feature")
+			fs.Int("api-download-from-max-entries", 0, "Set the maximum number of downloadFrom entries allowed per request. Set to 0 to disable this feature")
 			fs.Bool("api-disable-download-from", false, "Disable the download from feature")
-			fs.Bool("api-disable-health-check-logging", false, "Disable health check logging")
+			fs.Bool("api-disable-health-check-route-telemetry", true, "Disable telemetry for health check route")
+			fs.Bool("api-disable-root-route-telemetry", true, "Disable telemetry for the root route")
+			fs.Bool("api-disable-debug-route-telemetry", true, "Disable telemetry for the debug route")
+			fs.Bool("api-disable-version-route-telemetry", true, "Disable telemetry for the version route")
 			fs.Bool("api-enable-debug-route", false, "Enable the debug route")
+
+			// Deprecated flags.
+			fs.String("api-trace-header", "Gotenberg-Trace", "Set the header name to use for identifying requests")
+			fs.Bool("api-disable-health-check-logging", false, "Disable health check logging")
+
+			err := errors.Join(
+				fs.MarkDeprecated("api-trace-header", "use --api-correlation-id-header instead"),
+				fs.MarkDeprecated("api-disable-health-check-logging", "use --api-disable-health-check-route-telemetry instead"),
+			)
+			if err != nil {
+				panic(err)
+			}
 			return fs
 		}(),
 		New: func() gotenberg.Module { return new(Api) },
@@ -215,14 +256,22 @@ func (a *Api) Provision(ctx *gotenberg.Context) error {
 	a.timeout = flags.MustDuration("api-timeout")
 	a.bodyLimit = flags.MustHumanReadableBytes("api-body-limit")
 	a.rootPath = flags.MustString("api-root-path")
-	a.traceHeader = flags.MustString("api-trace-header")
+	a.correlationIdHeader = flags.MustDeprecatedString("api-trace-header", "api-correlation-id-header")
 	a.downloadFromCfg = downloadFromConfig{
-		allowList: flags.MustRegexp("api-download-from-allow-list"),
-		denyList:  flags.MustRegexp("api-download-from-deny-list"),
-		maxRetry:  flags.MustInt("api-download-from-max-retry"),
-		disable:   flags.MustBool("api-disable-download-from"),
+		allowList:              flags.MustRegexpSlice("api-download-from-allow-list"),
+		denyList:               flags.MustRegexpSlice("api-download-from-deny-list"),
+		denyPrivateIPs:         flags.MustBool("api-download-from-deny-private-ips"),
+		denyPublicIPs:          flags.MustBool("api-download-from-deny-public-ips"),
+		enableEnvironmentProxy: flags.MustBool("api-download-from-enable-environment-proxy"),
+		maxRetry:               flags.MustInt("api-download-from-max-retry"),
+		maxConcurrency:         flags.MustInt("api-download-from-max-concurrency"),
+		maxEntries:             flags.MustInt("api-download-from-max-entries"),
+		disable:                flags.MustBool("api-disable-download-from"),
 	}
-	a.disableHealthCheckLogging = flags.MustBool("api-disable-health-check-logging")
+	a.disableHealthCheckRouteTelemetry = flags.MustDeprecatedBool("api-disable-health-check-logging", "api-disable-health-check-route-telemetry")
+	a.disableRootRouteTelemetry = flags.MustBool("api-disable-root-route-telemetry")
+	a.disableDebugRouteTelemetry = flags.MustBool("api-disable-debug-route-telemetry")
+	a.disableVersionRouteTelemetry = flags.MustBool("api-disable-version-route-telemetry")
 	a.enableDebugRoute = flags.MustBool("api-enable-debug-route")
 
 	// Port from env?
@@ -248,6 +297,15 @@ func (a *Api) Provision(ctx *gotenberg.Context) error {
 		}
 		a.basicAuthUsername = basicAuthUsername
 		a.basicAuthPassword = basicAuthPassword
+	}
+
+	// Enable OIDC auth? The flags are populated from their API_OIDC_* env vars
+	// by the CLI, so no manual environment lookup is needed here.
+	a.oidcEnabled = flags.MustBool("api-enable-oidc-auth")
+	if a.oidcEnabled {
+		a.oidcIssuer = flags.MustString("api-oidc-issuer")
+		a.oidcAudience = flags.MustString("api-oidc-audience")
+		a.oidcJwksUrl = flags.MustString("api-oidc-jwks-url")
 	}
 
 	// Get routes from modules.
@@ -328,17 +386,9 @@ func (a *Api) Provision(ctx *gotenberg.Context) error {
 	}
 
 	// Logger.
-	loggerProvider, err := ctx.Module(new(gotenberg.LoggerProvider))
-	if err != nil {
-		return fmt.Errorf("get logger provider: %w", err)
-	}
+	a.logger = gotenberg.Logger(a)
 
-	logger, err := loggerProvider.(gotenberg.LoggerProvider).Logger(a)
-	if err != nil {
-		return fmt.Errorf("get logger: %w", err)
-	}
-
-	a.logger = logger
+	a.warnInsecureDebugRoute()
 
 	// File system.
 	a.fs = gotenberg.NewFileSystem(new(gotenberg.OsMkdirAll))
@@ -346,42 +396,103 @@ func (a *Api) Provision(ctx *gotenberg.Context) error {
 	return nil
 }
 
+// warnInsecureDebugRoute logs a warning when the debug route is reachable
+// without authentication.
+//
+// The route reports the resolved configuration of every module, which is
+// useful to an operator and equally useful to anyone else who can reach it.
+// This warns rather than refuses: an operator may sit behind a gateway that
+// authenticates on Gotenberg's behalf, and failing startup would break them.
+func (a *Api) warnInsecureDebugRoute() {
+	if !a.enableDebugRoute || a.basicAuthUsername != "" || a.oidcEnabled {
+		return
+	}
+	if a.logger == nil {
+		return
+	}
+
+	a.logger.WarnContext(
+		context.Background(),
+		"--api-enable-debug-route (API_ENABLE_DEBUG_ROUTE) is enabled but no authentication is configured, so anyone who can reach Gotenberg can read its configuration. Set --api-enable-basic-auth (API_ENABLE_BASIC_AUTH) with GOTENBERG_API_BASIC_AUTH_USERNAME and GOTENBERG_API_BASIC_AUTH_PASSWORD, set --api-enable-oidc-auth (API_ENABLE_OIDC_AUTH), or disable the route.",
+		slog.String("flag", "--api-enable-debug-route"),
+		slog.String("env", "API_ENABLE_DEBUG_ROUTE"),
+	)
+}
+
 // Validate validates the module properties.
 func (a *Api) Validate() error {
 	var err error
 
 	if a.port < 1 || a.port > 65535 {
-		err = multierr.Append(err,
+		err = errors.Join(err,
 			errors.New("port must be more than 1 and less than 65535"),
 		)
 	}
 
 	if a.bindIp != "" && net.ParseIP(a.bindIp) == nil {
-		err = multierr.Append(err, errors.New("IP must be a valid IP address"))
+		err = errors.Join(err, errors.New("IP must be a valid IP address"))
+	}
+
+	if a.downloadFromCfg.enableEnvironmentProxy {
+		proxyErr := gotenberg.ValidateEnvironmentProxyVariables()
+		if proxyErr != nil {
+			err = errors.Join(err, fmt.Errorf("--api-download-from-enable-environment-proxy is set: %w", proxyErr))
+		}
+	}
+
+	if a.downloadFromCfg.maxConcurrency < 0 {
+		err = errors.Join(err,
+			fmt.Errorf("download from max concurrency must not be negative, got %d; set --api-download-from-max-concurrency (env API_DOWNLOAD_FROM_MAX_CONCURRENCY) to 0 to disable the limit", a.downloadFromCfg.maxConcurrency),
+		)
+	}
+
+	if a.downloadFromCfg.maxEntries < 0 {
+		err = errors.Join(err,
+			fmt.Errorf("download from max entries must not be negative, got %d; set --api-download-from-max-entries (env API_DOWNLOAD_FROM_MAX_ENTRIES) to 0 to disable the limit", a.downloadFromCfg.maxEntries),
+		)
 	}
 
 	if (a.tlsCertFile != "" && a.tlsKeyFile == "") || (a.tlsCertFile == "" && a.tlsKeyFile != "") {
-		err = multierr.Append(err,
+		err = errors.Join(err,
 			errors.New("both TLS certificate and key files must be set"),
 		)
 	}
 
 	if !strings.HasPrefix(a.rootPath, "/") {
-		err = multierr.Append(err,
+		err = errors.Join(err,
 			errors.New("root path must start with /"),
 		)
 	}
 
 	if !strings.HasSuffix(a.rootPath, "/") {
-		err = multierr.Append(err,
+		err = errors.Join(err,
 			errors.New("root path must end with /"),
 		)
 	}
 
-	if len(strings.TrimSpace(a.traceHeader)) == 0 {
-		err = multierr.Append(err,
+	if len(strings.TrimSpace(a.correlationIdHeader)) == 0 {
+		err = errors.Join(err,
 			errors.New("trace header must not be empty"),
 		)
+	}
+
+	if a.basicAuthUsername != "" && a.oidcEnabled {
+		err = errors.Join(err,
+			errors.New("basic authentication and OIDC authentication cannot both be enabled"),
+		)
+	}
+
+	if a.oidcEnabled {
+		if a.oidcIssuer == "" {
+			err = errors.Join(err,
+				errors.New("OIDC issuer must not be empty when OIDC auth is enabled; set --api-oidc-issuer"),
+			)
+		}
+		if a.oidcAudience == "" {
+			err = errors.Join(err,
+				errors.New("OIDC audience must not be empty when OIDC auth is enabled; set --api-oidc-audience"),
+			)
+		}
 	}
 
 	if err != nil {
@@ -430,40 +541,62 @@ func (a *Api) Validate() error {
 	return nil
 }
 
+// newEchoServer builds the [echo.Echo] instance with the settings Gotenberg
+// relies on, independently of the routes and middlewares added by [Api.Start].
+func newEchoServer() *echo.Echo {
+	srv := echo.New()
+	srv.HTTPErrorHandler = httpErrorHandler()
+	// Echo v5 serves files through Echo.Filesystem, an [fs.FS] rooted at the
+	// working directory, and [fs.FS] rejects absolute names. Every output file
+	// lives under the request's temporary directory, so Context.Attachment gets
+	// an absolute path and the default filesystem answers 404 for every
+	// conversion. Rooting at "/" restores the v4 behavior, where the path was
+	// opened as-is.
+	srv.Filesystem = echo.NewDefaultFS("/")
+	// Echo v5 dropped the X-Forwarded-For and X-Real-IP fallbacks from
+	// Context.RealIP. Keep the previous behavior so that the access log still
+	// reports the client IP when Gotenberg sits behind a reverse proxy.
+	srv.IPExtractor = echo.LegacyIPExtractor()
+
+	return srv
+}
+
 // Start starts the HTTP server.
 func (a *Api) Start() error {
-	a.srv = echo.New()
-	a.srv.HideBanner = true
-	a.srv.HidePort = true
-	a.srv.Server.ReadTimeout = a.timeout
-	a.srv.Server.IdleTimeout = a.timeout
-	// See https://github.com/gotenberg/gotenberg/issues/396.
-	a.srv.Server.WriteTimeout = a.timeout + a.timeout
-	a.srv.HTTPErrorHandler = httpErrorHandler()
+	a.srv = newEchoServer()
 
 	// Let's prepare the modules' routes.
-	var disableLoggingForPaths []string
+	var disableTelemetryForPaths []string
 	for i, route := range a.routes {
 		a.routes[i].Path = strings.TrimPrefix(route.Path, "/")
 
-		if route.DisableLogging {
-			disableLoggingForPaths = append(disableLoggingForPaths, strings.TrimPrefix(route.Path, "/"))
+		if route.DisableTelemetry {
+			disableTelemetryForPaths = append(disableTelemetryForPaths, strings.TrimPrefix(route.Path, "/"))
 		}
 	}
 
-	// Check if the user wishes to add logging entries related to the health
-	// check route.
-	if a.disableHealthCheckLogging {
-		disableLoggingForPaths = append(disableLoggingForPaths, "health")
+	// Check if the user wishes to disable telemetry for specific routes.
+	if a.disableHealthCheckRouteTelemetry {
+		disableTelemetryForPaths = append(disableTelemetryForPaths, "health")
 	}
+	if a.disableRootRouteTelemetry {
+		disableTelemetryForPaths = append(disableTelemetryForPaths, "")
+	}
+	if a.disableDebugRouteTelemetry {
+		disableTelemetryForPaths = append(disableTelemetryForPaths, "debug")
+	}
+	if a.disableVersionRouteTelemetry {
+		disableTelemetryForPaths = append(disableTelemetryForPaths, "version")
+	}
+
+	serverName := fmt.Sprintf("%s:%d", a.bindIp, a.port)
 
 	// Add the API middlewares.
 	a.srv.Pre(
 		latencyMiddleware(),
 		rootPathMiddleware(a.rootPath),
-		traceMiddleware(a.traceHeader),
 		outputFilenameMiddleware(),
-		loggerMiddleware(a.logger, disableLoggingForPaths),
+		telemetryMiddleware(a.logger, serverName, a.correlationIdHeader, disableTelemetryForPaths),
 	)
 
 	// Add the modules' middlewares in their respective stacks.
@@ -481,13 +614,20 @@ func (a *Api) Start() error {
 
 	hardTimeout := a.timeout + (time.Duration(5) * time.Second)
 
-	// Basic auth?
+	// Authentication?
 	var securityMiddleware echo.MiddlewareFunc
-	if a.basicAuthUsername != "" {
+	switch {
+	case a.basicAuthUsername != "":
 		securityMiddleware = basicAuthMiddleware(a.basicAuthUsername, a.basicAuthPassword)
-	} else {
+	case a.oidcEnabled:
+		verifier, err := a.buildOidcVerifier()
+		if err != nil {
+			return fmt.Errorf("build OIDC verifier: %w", err)
+		}
+		securityMiddleware = oidcAuthMiddleware(verifier)
+	default:
 		securityMiddleware = func(next echo.HandlerFunc) echo.HandlerFunc {
-			return func(c echo.Context) error {
+			return func(c *echo.Context) error {
 				return next(c)
 			}
 		}
@@ -519,7 +659,7 @@ func (a *Api) Start() error {
 	// Root route.
 	a.srv.GET(
 		a.rootPath,
-		func(c echo.Context) error {
+		func(c *echo.Context) error {
 			return c.HTML(http.StatusOK, `Hey, Gotenberg has no UI, it's an API. Head to the <a href="https://gotenberg.dev">documentation</a> to learn how to interact with it 🚀`)
 		},
 		securityMiddleware,
@@ -528,14 +668,16 @@ func (a *Api) Start() error {
 	// Favicon route.
 	a.srv.GET(
 		fmt.Sprintf("%s%s", a.rootPath, "favicon.ico"),
-		func(c echo.Context) error {
+		func(c *echo.Context) error {
 			return c.NoContent(http.StatusNoContent)
 		},
 		securityMiddleware,
 	)
 
 	// Let's not forget the health check routes...
-	checks := append(a.healthChecks, health.WithTimeout(a.timeout))
+	checks := make([]health.CheckerOption, len(a.healthChecks), len(a.healthChecks)+1)
+	copy(checks, a.healthChecks)
+	checks = append(checks, health.WithTimeout(a.timeout))
 	checker := health.NewChecker(checks...)
 	healthCheckHandler := health.NewHandler(checker)
 
@@ -557,7 +699,7 @@ func (a *Api) Start() error {
 	// ...the version route.
 	a.srv.GET(
 		fmt.Sprintf("%s%s", a.rootPath, "version"),
-		func(c echo.Context) error {
+		func(c *echo.Context) error {
 			return c.String(http.StatusOK, gotenberg.Version)
 		},
 		securityMiddleware,
@@ -567,7 +709,7 @@ func (a *Api) Start() error {
 	if a.enableDebugRoute {
 		a.srv.GET(
 			fmt.Sprintf("%s%s", a.rootPath, "debug"),
-			func(c echo.Context) error {
+			func(c *echo.Context) error {
 				return c.JSONPretty(http.StatusOK, gotenberg.Debug(), "  ")
 			},
 			securityMiddleware,
@@ -588,19 +730,51 @@ func (a *Api) Start() error {
 		return fmt.Errorf("waiting for modules readiness: %w", err)
 	}
 
+	startConfig := echo.StartConfig{
+		Address:    fmt.Sprintf("%s:%d", a.bindIp, a.port),
+		HideBanner: true,
+		HidePort:   true,
+		BeforeServeFunc: func(s *http.Server) error {
+			s.ReadTimeout = a.timeout
+			s.IdleTimeout = a.timeout
+			// See https://github.com/gotenberg/gotenberg/issues/396.
+			s.WriteTimeout = a.timeout + a.timeout
+
+			if a.tlsCertFile == "" || a.tlsKeyFile == "" {
+				// Serve HTTP/2 Cleartext (h2c). Echo v5 dropped
+				// StartH2CServer and golang.org/x/net/http2/h2c is deprecated,
+				// so the standard library serves h2c through Server.Protocols
+				// instead.
+				protocols := new(http.Protocols)
+				protocols.SetHTTP1(true)
+				protocols.SetUnencryptedHTTP2(true)
+				s.Protocols = protocols
+			}
+
+			return nil
+		},
+	}
+
+	// Not named cancel: that would reassign the readiness timeout's cancel from
+	// above, whose deferred call is already bound to the old value.
+	serveCtx, serveCancel := context.WithCancel(context.Background())
+	a.shutdownCancel = serveCancel
+	a.serveDone = make(chan struct{})
+
 	// As the following code is blocking, run it in a goroutine.
 	go func() {
+		defer close(a.serveDone)
+
 		var err error
 		if a.tlsCertFile != "" && a.tlsKeyFile != "" {
 			// Start an HTTPS server (supports HTTP/2).
-			err = a.srv.StartTLS(fmt.Sprintf("%s:%d", a.bindIp, a.port), a.tlsCertFile, a.tlsKeyFile)
+			err = startConfig.StartTLS(serveCtx, a.srv, a.tlsCertFile, a.tlsKeyFile)
 		} else {
 			// Start an HTTP/2 Cleartext (non-HTTPS) server.
-			server := &http2.Server{}
-			err = a.srv.StartH2CServer(fmt.Sprintf("%s:%d", a.bindIp, a.port), server)
+			err = startConfig.Start(serveCtx, a.srv)
 		}
-		if !errors.Is(err, http.ErrServerClosed) {
-			a.logger.Fatal(err.Error())
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			a.logger.ErrorContext(context.Background(), err.Error())
 		}
 	}()
 
@@ -616,6 +790,26 @@ func (a *Api) StartupMessage() string {
 	return fmt.Sprintf("server started on %s:%d", ip, a.port)
 }
 
+// shutdown triggers the server's graceful shutdown and waits for it to
+// complete, or for ctx to be done. Cancelling the serve context is what Echo v5
+// exposes in place of Echo.Shutdown: [echo.StartConfig] shuts the server down
+// on its own deadline, so the shutdown proceeds even when ctx is already done.
+func (a *Api) shutdown(ctx context.Context) error {
+	if a.shutdownCancel == nil {
+		// Start never ran, so there is nothing to shut down.
+		return nil
+	}
+
+	a.shutdownCancel()
+
+	select {
+	case <-a.serveDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Stop stops the HTTP server.
 func (a *Api) Stop(ctx context.Context) error {
 	for {
@@ -625,15 +819,15 @@ func (a *Api) Stop(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
-			return a.srv.Shutdown(ctx)
+			return a.shutdown(ctx)
 		default:
-			a.logger.Debug(fmt.Sprintf("%d asynchronous requests", count))
+			a.logger.DebugContext(ctx, fmt.Sprintf("%d asynchronous requests", count))
 			if count > 0 {
 				time.Sleep(1 * time.Second)
 				continue
 			}
-			a.logger.Debug("no more asynchronous requests, continue with shutdown")
-			err := a.srv.Shutdown(ctx)
+			a.logger.DebugContext(ctx, "no more asynchronous requests, continue with shutdown")
+			err := a.shutdown(ctx)
 			if err != nil {
 				return fmt.Errorf("shutdown: %w", err)
 			}

@@ -1,3 +1,6 @@
+@pdfengines
+@pdfengines-encrypt
+@encrypt
 Feature: /forms/pdfengines/encrypt
 
   Scenario: POST /forms/pdfengines/encrypt (default - user password only)
@@ -110,8 +113,30 @@ Feature: /forms/pdfengines/encrypt
     Then the response status code should be 400
     Then the response body should match string:
       """
-      Invalid form data: form field 'userPassword' is required
+      Invalid form data: a 'userPassword' or 'ownerPassword' is required
       """
+
+  # https://github.com/gotenberg/gotenberg/discussions/1571
+  # Owner-only: opens without a password but restricts printing.
+  Scenario: POST /forms/pdfengines/encrypt (Owner-only, restrict printing)
+    Given I have a default Gotenberg container
+    When I make a "POST" request to Gotenberg at the "/forms/pdfengines/encrypt" endpoint with the following form data and header(s):
+      | files         | testdata/page_1.pdf | file  |
+      | ownerPassword | owner-secret        | field |
+      | allowPrinting | false               | field |
+    Then the response status code should be 200
+    Then the response header "Content-Type" should be "application/pdf"
+    Then there should be 1 PDF(s) in the response
+    Then the response PDF(s) should NOT be encrypted
+    Then the response PDF(s) should NOT allow "printing"
+
+  # Permission restrictions need a password to anchor them.
+  Scenario: POST /forms/pdfengines/encrypt (Permissions without password)
+    Given I have a default Gotenberg container
+    When I make a "POST" request to Gotenberg at the "/forms/pdfengines/encrypt" endpoint with the following form data and header(s):
+      | files         | testdata/page_1.pdf | file  |
+      | allowPrinting | false               | field |
+    Then the response status code should be 400
 
   Scenario: POST /forms/pdfengines/encrypt (Routes Disabled)
     Given I have a Gotenberg container with the following environment variable(s):
@@ -130,8 +155,9 @@ Feature: /forms/pdfengines/encrypt
     Then the response header "Content-Type" should be "application/pdf"
     Then the response header "Gotenberg-Trace" should be "forms_pdfengines_encrypt"
     Then the Gotenberg container should log the following entries:
-      | "trace":"forms_pdfengines_encrypt" |
+      | "correlation_id":"forms_pdfengines_encrypt" |
 
+  @download-from
   Scenario: POST /forms/pdfengines/encrypt (Download From)
     Given I have a default Gotenberg container
     Given I have a static server
@@ -143,6 +169,7 @@ Feature: /forms/pdfengines/encrypt
     Then there should be 1 PDF(s) in the response
     Then the response PDF(s) should be encrypted
 
+  @webhook
   Scenario: POST /forms/pdfengines/encrypt (Webhook)
     Given I have a default Gotenberg container
     Given I have a webhook server
@@ -175,3 +202,15 @@ Feature: /forms/pdfengines/encrypt
       | userPassword | foo                 | field |
     Then the response status code should be 200
     Then the response header "Content-Type" should be "application/pdf"
+
+  # See: https://github.com/gotenberg/gotenberg/issues/1500.
+  Scenario: POST /forms/pdfengines/encrypt (Long Filename)
+    Given I have a default Gotenberg container
+    When I make a "POST" request to Gotenberg at the "/forms/pdfengines/encrypt" endpoint with the following form data and header(s):
+      | files                     | testdata/Longitudinell_jämförelse_mellan_laserkirurgi_och_strålbehandling_gällande_röstkvalitet_och_självskattad_kommunikation_upp_till_två_år_efter_tidig_stämbandscancer_i_ett_randomiserat_kontrollerat_försök.pdf | file   |
+      | userPassword              | foo                                                                                                                                                                                                                   | field  |
+      | ownerPassword             | bar                                                                                                                                                                                                                   | field  |
+      | Gotenberg-Output-Filename | foo                                                                                                                                                                                                                   | header |
+    Then the response status code should be 200
+    Then the response header "Content-Type" should be "application/pdf"
+    Then there should be 1 PDF(s) in the response

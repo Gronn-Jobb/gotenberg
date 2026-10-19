@@ -20,6 +20,7 @@ func doRequest(method, url string, headers map[string]string, body io.Reader) (*
 		req.Header.Set(header, value)
 	}
 
+	// #nosec
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("send a request: %w", err)
@@ -28,14 +29,16 @@ func doRequest(method, url string, headers map[string]string, body io.Reader) (*
 	return resp, nil
 }
 
-func doFormDataRequest(method, url string, fields map[string]string, files map[string][]string, headers map[string]string) (*http.Response, error) {
+func doFormDataRequest(method, url string, fields map[string][]string, files map[string][]string, headers map[string]string) (*http.Response, error) {
 	var b bytes.Buffer
 	writer := multipart.NewWriter(&b)
 
-	for name, value := range fields {
-		err := writer.WriteField(name, value)
-		if err != nil {
-			return nil, fmt.Errorf("write field %q: %w", name, err)
+	for name, values := range fields {
+		for _, value := range values {
+			err := writer.WriteField(name, value)
+			if err != nil {
+				return nil, fmt.Errorf("write field %q: %w", name, err)
+			}
 		}
 	}
 
@@ -74,6 +77,7 @@ func doFormDataRequest(method, url string, fields map[string]string, files map[s
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
+	// #nosec
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("send a request: %w", err)

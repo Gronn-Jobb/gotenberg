@@ -1,0 +1,96 @@
+package chromium
+
+import (
+	"context"
+	"log/slog"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/dlclark/regexp2/v2"
+)
+
+// TestChromiumBrowser_Start_rejectsOverlappingStart guards against the latch
+// reported in https://github.com/gotenberg/gotenberg/issues/1599. When the
+// supervisor abandons a Start goroutine on request-deadline expiry, that
+// goroutine keeps running and holds startMu (and the pinning proxy it started)
+// until it unwinds. A second Start must be refused rather than proceeding to
+// start the pinning proxy a second time.
+func TestChromiumBrowser_Start_rejectsOverlappingStart(t *testing.T) {
+	b := &chromiumBrowser{initialCtx: context.Background()}
+
+	// Simulate a Start still in flight.
+	b.startMu.Lock()
+	defer b.startMu.Unlock()
+
+	err := b.Start(slog.New(slog.DiscardHandler))
+	if err == nil {
+		t.Fatal("expected an error when a start is already in progress, got nil")
+	}
+	if !strings.Contains(err.Error(), "already in progress") {
+		t.Fatalf("expected an 'already in progress' error, got %q", err)
+	}
+
+	// The guard must return before touching any startup resource, so no user
+	// profile directory is created and the browser stays not started.
+	if b.userProfileDirPath != "" {
+		t.Fatalf("expected no user profile directory to be created, got %q", b.userProfileDirPath)
+	}
+	if b.isStarted.Load() {
+		t.Fatal("expected the browser to stay not started")
+	}
+}
+
+// TestChromiumDisableFeatures guards the override described in
+// https://github.com/gotenberg/gotenberg/issues/1656. Gotenberg replaces
+// chromedp's --disable-features value rather than extending it, as
+// chromedp.Flag keys its flags by switch name. Dropping one of chromedp's own
+// entries while editing this list would silently re-enable it.
+func TestChromiumDisableFeatures(t *testing.T) {
+	for _, feature := range []string{
+		// chromedp.DefaultExecAllocatorOptions.
+		"site-per-process",
+		"Translate",
+		"BlinkGenPropertyTrees",
+		// The address-bar popup WebUI, built even in headless.
+		"WebUIOmniboxPopup",
+		"WebUIOmniboxAimPopup",
+	} {
+		if !slices.Contains(strings.Split(chromiumDisableFeatures, ","), feature) {
+			t.Errorf("expected %q to be disabled, got %q", feature, chromiumDisableFeatures)
+		}
+	}
+}
+
+// A WebSocket the outbound policy rejects must reach the pinning proxy, so
+// the implicit loopback proxy bypass is removed whenever a policy can reject
+// a network URL. See GHSA-73vq-mh8c-27wg.
+func TestBrowserArguments_restrictsNetwork(t *testing.T) {
+	re := func(patterns ...string) []*regexp2.Regexp {
+		var res []*regexp2.Regexp
+		for _, p := range patterns {
+			res = append(res, regexp2.MustCompile(p, regexp2.None))
+		}
+		return res
+	}
+
+	for _, tc := range []struct {
+		scenario string
+		args     browserArguments
+		expect   bool
+	}{
+		{scenario: "default deny-list only", args: browserArguments{denyList: re(defaultDenyListPattern)}, expect: false},
+		{scenario: "no lists", args: browserArguments{}, expect: false},
+		{scenario: "allow-list", args: browserArguments{allowList: re(`^https://example\.com`), denyList: re(defaultDenyListPattern)}, expect: true},
+		{scenario: "custom deny-list", args: browserArguments{denyList: re(`^http://internal`)}, expect: true},
+		{scenario: "default and custom deny-list", args: browserArguments{denyList: re(defaultDenyListPattern, `^http://internal`)}, expect: true},
+		{scenario: "deny private IPs", args: browserArguments{denyList: re(defaultDenyListPattern), denyPrivateIPs: true}, expect: true},
+		{scenario: "deny public IPs", args: browserArguments{denyPublicIPs: true}, expect: true},
+	} {
+		t.Run(tc.scenario, func(t *testing.T) {
+			if got := tc.args.restrictsNetwork(); got != tc.expect {
+				t.Fatalf("restrictsNetwork() = %t, want %t", got, tc.expect)
+			}
+		})
+	}
+}

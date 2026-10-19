@@ -14,20 +14,20 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 
 	"github.com/gotenberg/gotenberg/v8/pkg/gotenberg"
 	"github.com/gotenberg/gotenberg/v8/pkg/modules/api"
 )
 
 type sendOutputFileParams struct {
-	ctx              *api.Context
-	outputPath       string
-	extraHttpHeaders map[string]string
-	traceHeader      string
-	trace            string
-	client           *client
-	handleError      func(error)
+	ctx                 *api.Context
+	outputPath          string
+	extraHttpHeaders    map[string]string
+	correlationIdHeader string
+	correlationId       string
+	client              *client
+	handleError         func(error)
 }
 
 func webhookMiddleware(w *Webhook) api.Middleware {
@@ -72,23 +72,30 @@ func webhookMiddleware(w *Webhook) api.Middleware {
 					}
 
 					headers := map[string]string{
-						echo.HeaderContentType:   http.DetectContentType(fileHeader),
-						echo.HeaderContentLength: strconv.FormatInt(fileStat.Size(), 10),
-						params.traceHeader:       params.trace,
+						echo.HeaderContentType:     http.DetectContentType(fileHeader),
+						echo.HeaderContentLength:   strconv.FormatInt(fileStat.Size(), 10),
+						params.correlationIdHeader: params.correlationId,
 					}
 					_, ok := params.extraHttpHeaders[echo.HeaderContentDisposition]
 					if !ok {
 						headers[echo.HeaderContentDisposition] = fmt.Sprintf("attachment; filename=%q", params.ctx.OutputFilename(params.outputPath))
 					}
 
-					err = params.client.send(bufio.NewReader(outputFile), headers, false)
+					err = params.client.send(params.ctx, bufio.NewReader(outputFile), headers, false)
 					if err != nil {
 						params.ctx.Log().Error(fmt.Sprintf("send output file to webhook: %s", err))
 						params.handleError(err)
+						return
 					}
+
+					params.client.sendEvent(params.ctx, params.correlationIdHeader, params.correlationId, map[string]any{
+						"event":         "webhook.success",
+						"correlationId": params.correlationId,
+						"timestamp":     time.Now().UTC().Format(time.RFC3339Nano),
+					})
 				}
 
-				return func(c echo.Context) error {
+				return func(c *echo.Context) error {
 					webhookUrl := c.Request().Header.Get("Gotenberg-Webhook-Url")
 					if webhookUrl == "" {
 						// No webhook URL, call the next middleware in the chain.
@@ -98,13 +105,20 @@ func webhookMiddleware(w *Webhook) api.Middleware {
 					ctx := c.Get("context").(*api.Context)
 					cancel := c.Get("cancel").(context.CancelFunc)
 
-					// Do we have a webhook error URL in case of... error?
+					// Do we have a webhook error URL and/or an events URL?
+					// At least one must be provided.
 					webhookErrorUrl := c.Request().Header.Get("Gotenberg-Webhook-Error-Url")
-					if webhookErrorUrl == "" {
+					webhookEventsUrl := c.Request().Header.Get("Gotenberg-Webhook-Events-Url")
+
+					if webhookErrorUrl == "" && webhookEventsUrl == "" {
 						return api.WrapError(
-							errors.New("empty webhook error URL"),
-							api.NewSentinelHttpError(http.StatusBadRequest, "Invalid 'Gotenberg-Webhook-Error-Url' header: empty value or header not provided"),
+							errors.New("empty webhook error URL and events URL"),
+							api.NewSentinelHttpError(http.StatusBadRequest, "At least one of 'Gotenberg-Webhook-Error-Url' or 'Gotenberg-Webhook-Events-Url' headers must be provided"),
 						)
+					}
+
+					if webhookErrorUrl != "" {
+						ctx.Log().Warn("'Gotenberg-Webhook-Error-Url' header is deprecated, use 'Gotenberg-Webhook-Events-Url' instead")
 					}
 
 					deadline, ok := ctx.Deadline()
@@ -113,15 +127,22 @@ func webhookMiddleware(w *Webhook) api.Middleware {
 					}
 
 					// Let's check if the webhook URLs are acceptable according to our
-					// allowed/denied lists.
-					err := gotenberg.FilterDeadline(w.allowList, w.denyList, webhookUrl, deadline)
+					// allowed/denied lists, and against the IP-class options.
+					// See [gotenberg.FilterOutboundURL].
+					ipOpts := []gotenberg.DecideOption{
+						gotenberg.WithDenyPrivateIPs(w.denyPrivateIPs),
+						gotenberg.WithDenyPublicIPs(w.denyPublicIPs),
+					}
+					err := gotenberg.FilterOutboundURL(ctx, webhookUrl, w.allowList, w.denyList, deadline, ipOpts...)
 					if err != nil {
 						return fmt.Errorf("filter webhook URL: %w", err)
 					}
 
-					err = gotenberg.FilterDeadline(w.errorAllowList, w.errorDenyList, webhookErrorUrl, deadline)
-					if err != nil {
-						return fmt.Errorf("filter webhook error URL: %w", err)
+					if webhookErrorUrl != "" {
+						err = gotenberg.FilterOutboundURL(ctx, webhookErrorUrl, w.errorAllowList, w.errorDenyList, deadline, ipOpts...)
+						if err != nil {
+							return fmt.Errorf("filter webhook error URL: %w", err)
+						}
 					}
 
 					// Let's check the HTTP methods for calling the webhook URLs.
@@ -157,9 +178,12 @@ func webhookMiddleware(w *Webhook) api.Middleware {
 						return fmt.Errorf("get method to use for webhook: %w", err)
 					}
 
-					webhookErrorMethod, err := methodFromHeader("Gotenberg-Webhook-Error-Method")
-					if err != nil {
-						return fmt.Errorf("get method to use for webhook error: %w", err)
+					var webhookErrorMethod string
+					if webhookErrorUrl != "" {
+						webhookErrorMethod, err = methodFromHeader("Gotenberg-Webhook-Error-Method")
+						if err != nil {
+							return fmt.Errorf("get method to use for webhook error: %w", err)
+						}
 					}
 
 					// What about extra HTTP headers?
@@ -176,30 +200,41 @@ func webhookMiddleware(w *Webhook) api.Middleware {
 						}
 					}
 
-					// Retrieve values from echo.Context before it gets recycled.
+					// Filter the events URL if provided.
+					if webhookEventsUrl != "" {
+						err = gotenberg.FilterOutboundURL(ctx, webhookEventsUrl, w.allowList, w.denyList, deadline, ipOpts...)
+						if err != nil {
+							return fmt.Errorf("filter webhook events URL: %w", err)
+						}
+					}
+
+					// Retrieve values from [echo.Context] before it gets recycled.
 					// See https://github.com/gotenberg/gotenberg/issues/1000.
 					startTime := c.Get("startTime").(time.Time)
-					traceHeader := c.Get("traceHeader").(string)
-					trace := c.Get("trace").(string)
+					correlationIdHeader := c.Get("correlationIdHeader").(string)
+					correlationId := c.Get("correlationId").(string)
 
 					client := &client{
 						url:              webhookUrl,
 						method:           webhookMethod,
 						errorUrl:         webhookErrorUrl,
 						errorMethod:      webhookErrorMethod,
+						eventsUrl:        webhookEventsUrl,
 						extraHttpHeaders: extraHttpHeaders,
 						startTime:        startTime,
+						deliveryTimeout:  w.deliveryTimeout(),
 
 						client: &retryablehttp.Client{
-							HTTPClient: &http.Client{
-								Timeout: w.clientTimeout,
-							},
+							HTTPClient:   gotenberg.NewOutboundHttpClient(w.clientTimeout, w.allowList, w.denyList, w.enableEnvironmentProxy, ipOpts...),
 							RetryMax:     w.maxRetry,
 							RetryWaitMin: w.retryMinWait,
 							RetryWaitMax: w.retryMaxWait,
 							Logger:       gotenberg.NewLeveledLogger(ctx.Log()),
 							CheckRetry:   retryablehttp.DefaultRetryPolicy,
-							Backoff:      retryablehttp.DefaultBackoff,
+							// Not DefaultBackoff: it returns a remote Retry-After
+							// verbatim, ignoring --webhook-retry-max-wait (env
+							// WEBHOOK_RETRY_MAX_WAIT).
+							Backoff: gotenberg.ClampedBackoff,
 						},
 						logger: ctx.Log(),
 					}
@@ -226,13 +261,23 @@ func webhookMiddleware(w *Webhook) api.Middleware {
 
 						headers := map[string]string{
 							echo.HeaderContentType: echo.MIMEApplicationJSON,
-							traceHeader:            trace,
+							correlationIdHeader:    correlationId,
 						}
 
-						err = client.send(bytes.NewReader(b), headers, true)
+						err = client.send(ctx, bytes.NewReader(b), headers, true)
 						if err != nil {
 							ctx.Log().Error(fmt.Sprintf("send error response to webhook: %s", err.Error()))
 						}
+
+						client.sendEvent(ctx, correlationIdHeader, correlationId, map[string]any{
+							"event":         "webhook.error",
+							"correlationId": correlationId,
+							"timestamp":     time.Now().UTC().Format(time.RFC3339Nano),
+							"error": map[string]any{
+								"status":  status,
+								"message": message,
+							},
+						})
 					}
 
 					if w.enableSyncMode {
@@ -262,25 +307,53 @@ func webhookMiddleware(w *Webhook) api.Middleware {
 						}
 						// No error, let's send the output file to the webhook URL.
 						sendOutputFile(sendOutputFileParams{
-							ctx:              ctx,
-							outputPath:       outputPath,
-							extraHttpHeaders: extraHttpHeaders,
-							traceHeader:      traceHeader,
-							trace:            trace,
-							client:           client,
-							handleError:      handleError,
+							ctx:                 ctx,
+							outputPath:          outputPath,
+							extraHttpHeaders:    extraHttpHeaders,
+							correlationIdHeader: correlationIdHeader,
+							correlationId:       correlationId,
+							client:              client,
+							handleError:         handleError,
 						})
 						return c.NoContent(http.StatusNoContent)
 					}
+
+					cancel = detachAsyncContext(ctx, cancel)
+
 					// As a webhook URL has been given, we handle the request in a
 					// goroutine and return immediately.
+					//
+					// Echo returns the [echo.Context] back to its sync.Pool as
+					// soon as this synchronous handler returns ErrAsyncProcess.
+					// A concurrent request can then claim the recycled context
+					// and c.Reset() wipes the shared store, which would cause
+					// any c.Get("...").(T) assertion downstream of the webhook
+					// goroutine to panic on a nil value and crash the process.
+					// Snapshot the keys downstream reads onto a detached
+					// context before spawning the goroutine so pool reuse
+					// cannot reach into our async work.
+					detached := newDetachedContext(c, "logger", "context", "correlationId", "correlationIdHeader", "startTime")
+
 					w.asyncCount.Add(1)
 					go func() {
 						defer cancel()
 						defer w.asyncCount.Add(-1)
 
+						// Defense in depth: any panic that escapes the
+						// downstream chain (including future regressions of
+						// the pool-reuse bug) routes through handleError and
+						// leaves the process running.
+						defer func() {
+							r := recover()
+							if r == nil {
+								return
+							}
+							ctx.Log().Error(fmt.Sprintf("webhook goroutine panic: %v", r))
+							handleError(fmt.Errorf("internal error: %v", r))
+						}()
+
 						// Call the next middleware in the chain.
-						err := next(c)
+						err := next(detached)
 						if err != nil {
 							if errors.Is(err, api.ErrNoOutputFile) {
 								errNoOutputFile := fmt.Errorf("%w - the webhook middleware cannot handle the result of this route", err)
@@ -309,13 +382,13 @@ func webhookMiddleware(w *Webhook) api.Middleware {
 						}
 
 						sendOutputFile(sendOutputFileParams{
-							ctx:              ctx,
-							outputPath:       outputPath,
-							extraHttpHeaders: extraHttpHeaders,
-							traceHeader:      traceHeader,
-							trace:            trace,
-							client:           client,
-							handleError:      handleError,
+							ctx:                 ctx,
+							outputPath:          outputPath,
+							extraHttpHeaders:    extraHttpHeaders,
+							correlationIdHeader: correlationIdHeader,
+							correlationId:       correlationId,
+							client:              client,
+							handleError:         handleError,
 						})
 					}()
 

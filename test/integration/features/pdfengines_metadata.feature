@@ -1,4 +1,7 @@
-Feature: /forms/pdfengines/{write|read}
+@pdfengines
+@pdfengines-metadata
+@metadata
+Feature: /forms/pdfengines/metadata/{write|read}
 
   Scenario: POST /forms/pdfengines/metadata/{write|read} (Single PDF)
     Given I have a default Gotenberg container
@@ -89,7 +92,8 @@ Feature: /forms/pdfengines/{write|read}
     Then the response header "Content-Type" should be "text/plain; charset=UTF-8"
     Then the response body should match string:
       """
-      Invalid form data: form field 'metadata' is required; no form file found for extensions: [.pdf]
+      Invalid form data: form field 'metadata' is required
+      no form file found for extensions: [.pdf]
       """
     Given I have a default Gotenberg container
     When I make a "POST" request to Gotenberg at the "/forms/pdfengines/metadata/write" endpoint with the following form data and header(s):
@@ -100,6 +104,43 @@ Feature: /forms/pdfengines/{write|read}
     Then the response body should match string:
       """
       Invalid form data: form field 'metadata' is invalid (got 'foo', resulting to unmarshal metadata: invalid character 'o' in literal false (expecting 'a'))
+      """
+
+  Scenario: POST /forms/pdfengines/metadata/write (Reject Newline-Injected Pseudo-Tag)
+    # Regression: a newline in a metadata value would split go-exiftool's
+    # stdin line and inject an arbitrary ExifTool pseudo-tag such as
+    # -FileName=, -SymLink=, or -HardLink=, allowing arbitrary filesystem
+    # writes as the container user. WriteMetadata now rejects values
+    # containing control characters with HTTP 400.
+    Given I have a default Gotenberg container
+    When I make a "POST" request to Gotenberg at the "/forms/pdfengines/metadata/write" endpoint with the following form data and header(s):
+      | files    | testdata/page_1.pdf                            | file  |
+      | metadata | {"Title":"test\\n-FileName=/tmp/inject_proof"} | field |
+    Then the response status code should be 400
+    Then the response header "Content-Type" should be "text/plain; charset=UTF-8"
+    Then the response body should contain string:
+      """
+      The requested metadata could not be written
+      """
+
+  Scenario: POST /forms/pdfengines/metadata/write (Reject Group-Prefixed Dangerous Tag)
+    # Regression: ExifTool treats "System:FileName" identically to "FileName".
+    # The dangerous-tag blocklist must strip group prefixes before comparing,
+    # otherwise the attacker renames/moves files with a single HTTP request.
+    Given I have a default Gotenberg container
+    When I make a "POST" request to Gotenberg at the "/forms/pdfengines/metadata/write" endpoint with the following form data and header(s):
+      | files                     | testdata/page_1.pdf                                                         | file   |
+      | metadata                  | {"System:FileName":"stolen.pdf","System:Directory":"/tmp","Author":"legit"} | field  |
+      | Gotenberg-Output-Filename | foo                                                                         | header |
+    Then the response status code should be 200
+    Then the response header "Content-Type" should be "application/pdf"
+    Then there should be 1 PDF(s) in the response
+    When I make a "POST" request to Gotenberg at the "/forms/pdfengines/metadata/read" endpoint with the following form data and header(s):
+      | files | teststore/foo.pdf | file |
+    Then the response status code should be 200
+    Then the response body should contain string:
+      """
+      "Author":"legit"
       """
 
   Scenario: POST /forms/pdfengines/metadata/read (Bad Request)
@@ -138,7 +179,7 @@ Feature: /forms/pdfengines/{write|read}
     Then the response header "Content-Type" should be "application/pdf"
     Then the response header "Gotenberg-Trace" should be "forms_pdfengines_metadata_write"
     Then the Gotenberg container should log the following entries:
-      | "trace":"forms_pdfengines_metadata_write" |
+      | "correlation_id":"forms_pdfengines_metadata_write" |
 
   Scenario: POST /forms/pdfengines/metadata/read (Gotenberg Trace)
     Given I have a default Gotenberg container
@@ -149,8 +190,9 @@ Feature: /forms/pdfengines/{write|read}
     Then the response header "Content-Type" should be "application/json"
     Then the response header "Gotenberg-Trace" should be "forms_pdfengines_metadata_read"
     Then the Gotenberg container should log the following entries:
-      | "trace":"forms_pdfengines_metadata_read" |
+      | "correlation_id":"forms_pdfengines_metadata_read" |
 
+  @output-filename
   Scenario: POST /forms/pdfengines/metadata/write (Output Filename - Single PDF)
     Given I have a default Gotenberg container
     When I make a "POST" request to Gotenberg at the "/forms/pdfengines/metadata/write" endpoint with the following form data and header(s):
@@ -162,6 +204,7 @@ Feature: /forms/pdfengines/{write|read}
     Then there should be the following file(s) in the response:
       | foo.pdf |
 
+  @output-filename
   Scenario: POST /forms/pdfengines/metadata/write (Output Filename - Many PDFs)
     Given I have a default Gotenberg container
     When I make a "POST" request to Gotenberg at the "/forms/pdfengines/metadata/write" endpoint with the following form data and header(s):
@@ -176,6 +219,7 @@ Feature: /forms/pdfengines/{write|read}
       | page_1.pdf |
       | page_2.pdf |
 
+  @download-from
   Scenario: POST /forms/pdfengines/metadata/write (Download From)
     Given I have a default Gotenberg container
     Given I have a static server
@@ -187,6 +231,7 @@ Feature: /forms/pdfengines/{write|read}
     Then the response status code should be 200
     Then the response header "Content-Type" should be "application/pdf"
 
+  @download-from
   Scenario: POST /forms/pdfengines/metadata/read (Download From)
     Given I have a default Gotenberg container
     Given I have a static server
@@ -196,6 +241,7 @@ Feature: /forms/pdfengines/{write|read}
     Then the response status code should be 200
     Then the response header "Content-Type" should be "application/json"
 
+  @webhook
   Scenario: POST /forms/pdfengines/metadata/write (Webhook)
     Given I have a default Gotenberg container
     Given I have a webhook server
@@ -233,6 +279,7 @@ Feature: /forms/pdfengines/{write|read}
       }
       """
 
+  @webhook
   Scenario: POST /forms/pdfengines/metadata/read (Webhook)
     Given I have a default Gotenberg container
     Given I have a webhook server
@@ -284,3 +331,21 @@ Feature: /forms/pdfengines/{write|read}
       | files | teststore/foo.pdf | file |
     Then the response status code should be 200
     Then the response header "Content-Type" should be "application/json"
+
+  # See: https://github.com/gotenberg/gotenberg/issues/1500.
+  Scenario: POST /forms/pdfengines/metadata/read (Long Filename)
+    Given I have a default Gotenberg container
+    When I make a "POST" request to Gotenberg at the "/forms/pdfengines/metadata/read" endpoint with the following form data and header(s):
+      | files | testdata/Longitudinell_jämförelse_mellan_laserkirurgi_och_strålbehandling_gällande_röstkvalitet_och_självskattad_kommunikation_upp_till_två_år_efter_tidig_stämbandscancer_i_ett_randomiserat_kontrollerat_försök.pdf | file |
+    Then the response status code should be 200
+
+  # See: https://github.com/gotenberg/gotenberg/issues/1500.
+  Scenario: POST /forms/pdfengines/metadata/write (Long Filename)
+    Given I have a default Gotenberg container
+    When I make a "POST" request to Gotenberg at the "/forms/pdfengines/metadata/write" endpoint with the following form data and header(s):
+      | files                     | testdata/Longitudinell_jämförelse_mellan_laserkirurgi_och_strålbehandling_gällande_röstkvalitet_och_självskattad_kommunikation_upp_till_två_år_efter_tidig_stämbandscancer_i_ett_randomiserat_kontrollerat_försök.pdf | file   |
+      | metadata                  | {"Author":"Test"}                                                                                                                                                                                                     | field  |
+      | Gotenberg-Output-Filename | foo                                                                                                                                                                                                                   | header |
+    Then the response status code should be 200
+    Then the response header "Content-Type" should be "application/pdf"
+    Then there should be 1 PDF(s) in the response
