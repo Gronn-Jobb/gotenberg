@@ -1,3 +1,4 @@
+@root
 Feature: /
 
   Scenario: GET /
@@ -11,19 +12,31 @@ Feature: /
       """
 
   Scenario: GET / (Gotenberg Trace)
-    Given I have a default Gotenberg container
+    Given I have a Gotenberg container with the following environment variable(s):
+      | API_DISABLE_ROOT_ROUTE_TELEMETRY | false |
     When I make a "GET" request to Gotenberg at the "/" endpoint with the following header(s):
       | Gotenberg-Trace | root |
     Then the response status code should be 200
     Then the response header "Gotenberg-Trace" should be "root"
     Then the Gotenberg container should log the following entries:
-      | "trace":"root" |
+      | "correlation_id":"root" |
 
   Scenario: GET / (Basic Auth)
     Given I have a Gotenberg container with the following environment variable(s):
       | API_ENABLE_BASIC_AUTH             | true |
       | GOTENBERG_API_BASIC_AUTH_USERNAME | foo  |
       | GOTENBERG_API_BASIC_AUTH_PASSWORD | bar  |
+    When I make a "GET" request to Gotenberg at the "/" endpoint
+    Then the response status code should be 401
+
+  # A request without a Bearer token is rejected. The JWKS URL is never fetched
+  # here, so no OIDC provider needs to be reachable.
+  Scenario: GET / (OIDC Auth)
+    Given I have a Gotenberg container with the following environment variable(s):
+      | API_ENABLE_OIDC_AUTH | true                             |
+      | API_OIDC_ISSUER      | https://gotenberg.test/          |
+      | API_OIDC_AUDIENCE    | gotenberg                        |
+      | API_OIDC_JWKS_URL    | https://gotenberg.test/jwks.json |
     When I make a "GET" request to Gotenberg at the "/" endpoint
     Then the response status code should be 401
 
@@ -45,7 +58,7 @@ Feature: /
     Then the response status code should be 204
     Then the response header "Gotenberg-Trace" should be "favicon"
     Then the Gotenberg container should log the following entries:
-      | "trace":"favicon" |
+      | "correlation_id":"favicon" |
 
   Scenario: GET /favicon.ico (Basic Auth)
     Given I have a Gotenberg container with the following environment variable(s):

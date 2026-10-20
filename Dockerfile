@@ -1,7 +1,7 @@
 # ARG instructions do not create additional layers. Instead, next layers will
 # concatenate them. Also, we have to repeat ARG instructions in each build
 # stage that uses them.
-ARG GOLANG_VERSION=1.25.0
+ARG GOLANG_VERSION=1.27.1
 
 # ----------------------------------------------
 # pdfcpu binary build stage
@@ -11,22 +11,22 @@ ARG GOLANG_VERSION=1.25.0
 FROM golang:$GOLANG_VERSION AS pdfcpu-binary-stage
 
 # See https://github.com/pdfcpu/pdfcpu/releases.
-ARG PDFCPU_VERSION=v0.11.0
+ARG PDFCPU_VERSION=v0.15.0
 ENV CGO_ENABLED=0
 
 # Define the working directory outside of $GOPATH (we're using go modules).
 WORKDIR /home
 
-RUN curl -Ls "https://github.com/pdfcpu/pdfcpu/archive/refs/tags/$PDFCPU_VERSION.tar.gz" -o pdfcpu.tar.gz &&\
-    tar --strip-components=1 -xvzf pdfcpu.tar.gz
+RUN curl -Ls "https://github.com/pdfcpu/pdfcpu/archive/refs/tags/$PDFCPU_VERSION.tar.gz" -o pdfcpu.tar.gz \
+    && tar --strip-components=1 -xvzf pdfcpu.tar.gz
 
 # Install module dependencies.
-RUN go mod download &&\
-    go mod verify
+RUN go mod download \
+    && go mod verify
 
-RUN go build -o pdfcpu -ldflags "-s -w -X 'main.version=$PDFCPU_VERSION' -X 'github.com/pdfcpu/pdfcpu/pkg/pdfcpu.VersionStr=$PDFCPU_VERSION' -X main.builtBy=gotenberg" ./cmd/pdfcpu &&\
+RUN go build -o pdfcpu -ldflags "-s -w -X 'main.version=$PDFCPU_VERSION' -X 'github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model.VersionStr=$PDFCPU_VERSION' -X main.builtBy=gotenberg" ./cmd/pdfcpu \
     # Verify installation.
-    ./pdfcpu version
+    && ./pdfcpu version
 
 # ----------------------------------------------
 # Gotenberg binary build stage
@@ -42,32 +42,16 @@ WORKDIR /home
 # Install module dependencies.
 COPY go.mod go.sum ./
 
-RUN go mod download &&\
-    go mod verify
+RUN go mod download \
+    && go mod verify
 
 # Copy the source code.
 COPY cmd ./cmd
 COPY pkg ./pkg
 
-RUN go build -o gotenberg -ldflags "-s -w -X 'github.com/gotenberg/gotenberg/v8/cmd.Version=$GOTENBERG_VERSION'" cmd/gotenberg/main.go
-
-# ----------------------------------------------
-# Compress Golang binaries stage
-# ----------------------------------------------
-FROM debian:13-slim AS compress-go-binaries-stage
-
-RUN \
-    echo "deb http://deb.debian.org/debian bookworm-backports main" >> /etc/apt/sources.list &&\
-    apt-get update -qq &&\
-    apt-get upgrade -yqq &&\
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends -t bookworm-backports upx-ucl
-
-COPY --from=pdfcpu-binary-stage /home/pdfcpu /home/pdfcpu
-COPY --from=gotenberg-binary-stage /home/gotenberg /home/gotenberg
-
-RUN \
-    upx-ucl --best /home/pdfcpu &&\
-    upx-ucl --best /home/gotenberg
+RUN go build -o gotenberg -ldflags "-s -w -X 'github.com/gotenberg/gotenberg/v8/cmd.Version=$GOTENBERG_VERSION'" cmd/gotenberg/main.go \
+    && go build -o gotenberg-chromium -ldflags "-s -w -X 'github.com/gotenberg/gotenberg/v8/cmd.Version=$GOTENBERG_VERSION'" cmd/gotenberg-chromium/main.go \
+    && go build -o gotenberg-libreoffice -ldflags "-s -w -X 'github.com/gotenberg/gotenberg/v8/cmd.Version=$GOTENBERG_VERSION'" cmd/gotenberg-libreoffice/main.go
 
 # ----------------------------------------------
 # Custom JRE stage
@@ -75,10 +59,16 @@ RUN \
 # ----------------------------------------------
 FROM debian:13-slim AS custom-jre-stage
 
-RUN \
-    apt-get update -qq &&\
-    apt-get upgrade -yqq &&\
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends default-jdk-headless binutils
+# APT_SNAPSHOT busts every layer below it when CI rotates the value, weekly.
+# Without it a persistent build cache turns the unpinned "apt-get upgrade" into
+# a cache hit and the published image keeps shipping the package versions that
+# were current when the cache was first populated.
+ARG APT_SNAPSHOT=""
+
+RUN echo "apt snapshot: $APT_SNAPSHOT" \
+    && apt-get update -qq \
+    && apt-get upgrade -yqq \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends default-jdk-headless binutils
 
 # Note: jdeps helps finding which modules a JAR requires.
 # Currently only for PDFtk, as we don't rely on LibreOffice UNO Java SDK.
@@ -93,115 +83,112 @@ RUN jlink \
     --output /custom-jre
 
 # ----------------------------------------------
+# Downloader stage
+# ----------------------------------------------
+FROM debian:13-slim AS downloader-stage
+
+# See https://gitlab.com/pdftk-java/pdftk/-/releases - Binary package.
+ARG PDFTK_VERSION=v3.3.3
+
+RUN apt-get update -qq \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends curl ca-certificates
+
+WORKDIR /downloads
+
+RUN curl -Ls https://raw.githubusercontent.com/gotenberg/unoconverter/v0.5.0/unoconv -o unoconverter \
+    && chmod +x unoconverter
+
+RUN curl -o pdftk-all.jar "https://gitlab.com/api/v4/projects/5024297/packages/generic/pdftk-java/$PDFTK_VERSION/pdftk-all.jar" \
+    && chmod a+x pdftk-all.jar
+
+# ----------------------------------------------
 # Base image stage
 # ----------------------------------------------
 FROM debian:13-slim AS base-image-stage
 
-COPY --from=custom-jre-stage /custom-jre /opt/java
+ARG TIMEZONE=UTC
+ENV TZ=$TIMEZONE
+
+COPY --link --from=custom-jre-stage /custom-jre /opt/java
 
 ENV PATH="/opt/java/bin:${PATH}"
 
 # ----------------------------------------------
-# Final stage
+# Common stage
 # ----------------------------------------------
-FROM base-image-stage
+FROM base-image-stage AS common-stage
 
-ARG GOTENBERG_VERSION=snapshot
 ARG GOTENBERG_USER_GID=1001
 ARG GOTENBERG_USER_UID=1001
-# See https://github.com/googlefonts/noto-emoji/releases.
-ARG NOTO_COLOR_EMOJI_VERSION=v2.048
-# See https://gitlab.com/pdftk-java/pdftk/-/releases - Binary package.
-ARG PDFTK_VERSION=v3.3.3
 
-LABEL org.opencontainers.image.title="Gotenberg" \
-    org.opencontainers.image.description="A containerized API for seamless PDF conversion." \
-    org.opencontainers.image.version="$GOTENBERG_VERSION" \
-    org.opencontainers.image.authors="Julien Neuhart <neuhart.julien@gmail.com>" \
-    org.opencontainers.image.documentation="https://gotenberg.dev" \
-    org.opencontainers.image.source="https://github.com/gotenberg/gotenberg"
+# See the note on APT_SNAPSHOT in custom-jre-stage. Declaring it here covers
+# every "apt-get upgrade" in the gotenberg, gotenberg-chromium and
+# gotenberg-libreoffice targets too, since all three branch from this stage.
+ARG APT_SNAPSHOT=""
 
-RUN \
-    # Create a non-root user.
-    # All processes in the Docker container will run with this dedicated user.
-    groupadd --gid "$GOTENBERG_USER_GID" gotenberg &&\
-    useradd --uid "$GOTENBERG_USER_UID" --gid gotenberg --shell /bin/bash --home /home/gotenberg --no-create-home gotenberg &&\
-    mkdir /home/gotenberg &&\
-    chown gotenberg: /home/gotenberg
+# Create a non-root user.
+# All processes in the Docker container will run with this dedicated user.
+RUN echo "apt snapshot: $APT_SNAPSHOT" \
+    && groupadd --gid "$GOTENBERG_USER_GID" gotenberg \
+    && useradd --uid "$GOTENBERG_USER_UID" --gid gotenberg --shell /bin/bash --home /home/gotenberg --no-create-home gotenberg \
+    && mkdir /home/gotenberg \
+    && chown gotenberg: /home/gotenberg
 
-RUN \
-    # Install system dependencies required for the next instructions or debugging.
-    # Note: tini is a helper for reaping zombie processes.
-    apt-get update -qq &&\
-    apt-get upgrade -yqq &&\
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends curl gnupg tini python3 python3-distutils-extra &&\
+# Note: tini is a helper for reaping zombie processes.
+RUN apt-get update -qq \
+    && apt-get upgrade -yqq \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        ca-certificates \
+        tini \
+        # Many users rely on curl for Docker health checks.
+        curl \
+        # Install fonts.
+        # Essential metric-compatible fonts for LibreOffice layout fidelity (replaces MS Fonts).
+        fonts-crosextra-carlito \
+        fonts-crosextra-caladea \
+        fonts-liberation \
+        fonts-liberation2 \
+        # Reliable general-purpose fallback for Chromium.
+        fonts-dejavu \
+        # Unified CJK (Chinese, Japanese, Korean) support.
+        fonts-noto-cjk \
+        # Standard Emoji support.
+        fonts-noto-color-emoji \
+        # Tofu prevention.
+        fonts-noto-core \
+        # Install QPDF & ExifTool (PDF engines).
+        qpdf exiftool \
+    # See https://github.com/nextcloud/docker/issues/380.
+    && mkdir -p /usr/share/man/man1 \
     # Cleanup.
-    # Note: the Debian image does automatically a clean after each install thanks to a hook.
-    # Therefore, there is no need for apt-get clean.
-    # See https://stackoverflow.com/a/24417119/3248473.
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-RUN \
-    # Install fonts.
-    # Credits:
-    # https://github.com/arachnys/athenapdf/blob/master/cli/Dockerfile.
-    # https://help.accusoft.com/PrizmDoc/v12.1/HTML/Installing_Asian_Fonts_on_Ubuntu_and_Debian.html.
-    curl -o ./ttf-mscorefonts-installer_3.8.1_all.deb http://httpredir.debian.org/debian/pool/contrib/m/msttcorefonts/ttf-mscorefonts-installer_3.8.1_all.deb &&\
-    apt-get update -qq &&\
-    apt-get upgrade -yqq &&\
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-    ./ttf-mscorefonts-installer_3.8.1_all.deb \
-    culmus \
-    fonts-beng \
-    fonts-hosny-amiri \
-    fonts-lklug-sinhala \
-    fonts-lohit-guru \
-    fonts-lohit-knda \
-    fonts-samyak-gujr \
-    fonts-samyak-mlym \
-    fonts-samyak-taml \
-    fonts-sarai \
-    fonts-sil-abyssinica \
-    fonts-sil-padauk \
-    fonts-telu \
-    fonts-thai-tlwg \
-    ttf-wqy-zenhei \
-    fonts-arphic-ukai \
-    fonts-arphic-uming \
-    fonts-ipafont-mincho \
-    fonts-ipafont-gothic \
-    fonts-unfonts-core \
-    # LibreOffice recommends.
-    fonts-crosextra-caladea \
-    fonts-crosextra-carlito \
-    fonts-dejavu \
-    fonts-liberation \
-    fonts-liberation2 \
-    fonts-linuxlibertine \
-    fonts-noto-cjk \
-    fonts-noto-core \
-    fonts-noto-mono \
-    fonts-noto-ui-core \
-    fonts-sil-gentium \
-    fonts-sil-gentium-basic &&\
-    rm -f ./ttf-mscorefonts-installer_3.8.1_all.deb &&\
-    # Add Color and Black-and-White Noto emoji font.
-    # Credits:
-    # https://github.com/gotenberg/gotenberg/pull/325.
-    # https://github.com/googlefonts/noto-emoji.
-    curl -Ls "https://github.com/googlefonts/noto-emoji/raw/$NOTO_COLOR_EMOJI_VERSION/fonts/NotoColorEmoji.ttf" -o /usr/local/share/fonts/NotoColorEmoji.ttf &&\
-    # Cleanup.
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+# PDFtk bash wrapper.
+# See https://github.com/gotenberg/gotenberg/pull/273.
+RUN printf '#!/bin/bash\n\nexec java -jar /usr/bin/pdftk-all.jar "$@"' > /usr/bin/pdftk \
+    && chmod +x /usr/bin/pdftk
 
-RUN \
-    # Install Chromium.
-    apt-get update -qq &&\
-    apt-get upgrade -yqq &&\
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends chromium &&\
-    # Verify installation.
-    chromium --version &&\
-    # Cleanup.
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+# Support for arbitrary user IDs (OpenShift).
+# See:
+# https://github.com/gotenberg/gotenberg/issues/1049.
+# https://docs.redhat.com/en/documentation/openshift_container_platform/4.15/html/images/creating-images#use-uid_create-images.
+RUN usermod -aG root gotenberg \
+    && chgrp -R 0 /home/gotenberg \
+    && chmod -R g=u /home/gotenberg
+
+# COPY instructions last to maximize cache reuse when only source code changes.
+
+# Improve fonts subpixel hinting and smoothing.
+# Credits:
+# https://github.com/arachnys/athenapdf/issues/69.
+# https://github.com/arachnys/athenapdf/commit/ba25a8d80a25d08d58865519c4cd8756dc9a336d.
+COPY --link build/fonts.conf /etc/fonts/conf.d/100-gotenberg.conf
+
+# Copy PDFtk jar.
+COPY --link --from=downloader-stage /downloads/pdftk-all.jar /usr/bin/pdftk-all.jar
+
+# Copy the pdfcpu binary (shared across all variants).
+COPY --link --from=pdfcpu-binary-stage /home/pdfcpu /usr/bin/
 
 # Set default characterset encoding to UTF-8.
 # See:
@@ -210,72 +197,107 @@ RUN \
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
-RUN \
-    # Install LibreOffice & unoconverter.
-    apt-get update -qq &&\
-    apt-get upgrade -yqq &&\
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends libreoffice &&\
-    curl -Ls https://raw.githubusercontent.com/gotenberg/unoconverter/v0.1.1/unoconv -o /usr/bin/unoconverter &&\
-    chmod +x /usr/bin/unoconverter &&\
-    # unoconverter will look for the Python binary, which has to be at version 3.
-    ln -s /usr/bin/python3 /usr/bin/python &&\
-    # Verify installations.
-    libreoffice --version &&\
-    unoconverter --version &&\
-    # Cleanup.
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
-RUN \
-    # Install PDFtk, QPDF & ExifTool (PDF engines).
-    # See https://github.com/gotenberg/gotenberg/pull/273.
-    curl -o /usr/bin/pdftk-all.jar "https://gitlab.com/api/v4/projects/5024297/packages/generic/pdftk-java/$PDFTK_VERSION/pdftk-all.jar" &&\
-    chmod a+x /usr/bin/pdftk-all.jar &&\
-    printf '#!/bin/bash\n\nexec java -jar /usr/bin/pdftk-all.jar "$@"' > /usr/bin/pdftk && \
-    chmod +x /usr/bin/pdftk &&\
-    apt-get update -qq &&\
-    apt-get upgrade -yqq &&\
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends qpdf exiftool &&\
-    # See https://github.com/nextcloud/docker/issues/380.
-    mkdir -p /usr/share/man/man1 &&\
-    # Verify installations.
-    pdftk --version &&\
-    qpdf --version &&\
-    exiftool --version &&\
-    # Cleanup.
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
-# Support for arbitrary user IDs (OpenShift).
-# See:
-# https://github.com/gotenberg/gotenberg/issues/1049.
-# https://docs.redhat.com/en/documentation/openshift_container_platform/4.15/html/images/creating-images#use-uid_create-images.
-RUN \
-    usermod -aG root gotenberg &&\
-    chgrp -R 0 /home/gotenberg &&\
-    chmod -R g=u /home/gotenberg
-
-# Improve fonts subpixel hinting and smoothing.
-# Credits:
-# https://github.com/arachnys/athenapdf/issues/69.
-# https://github.com/arachnys/athenapdf/commit/ba25a8d80a25d08d58865519c4cd8756dc9a336d.
-COPY build/fonts.conf /etc/fonts/conf.d/100-gotenberg.conf
-
-# Copy dictionnaries so that hypens work on Chromium.
-# See https://github.com/gotenberg/gotenberg/issues/1293.
-COPY --chown=gotenberg:gotenberg build/chromium-hyphen-data /opt/gotenberg/chromium-hyphen-data
-
-# Copy the Golang binaries.
-COPY --from=compress-go-binaries-stage /home/pdfcpu /usr/bin/
-COPY --from=compress-go-binaries-stage /home/gotenberg /usr/bin/
-
-# Environment variables required by modules or else.
-ENV CHROMIUM_BIN_PATH=/usr/bin/chromium
-ENV CHROMIUM_HYPHEN_DATA_DIR_PATH=/opt/gotenberg/chromium-hyphen-data
-ENV LIBREOFFICE_BIN_PATH=/usr/lib/libreoffice/program/soffice.bin
-ENV UNOCONVERTER_BIN_PATH=/usr/bin/unoconverter
+# Environment variables for PDF engines.
 ENV PDFTK_BIN_PATH=/usr/bin/pdftk
 ENV QPDF_BIN_PATH=/usr/bin/qpdf
 ENV EXIFTOOL_BIN_PATH=/usr/bin/exiftool
 ENV PDFCPU_BIN_PATH=/usr/bin/pdfcpu
+
+# Capture backing-binary versions at build time so the running process reports
+# them on traces without spawning the binaries at startup or per request.
+# See pkg/gotenberg/buildversions.go. Chromium and LibreOffice are captured in
+# the variant stages below, where they are installed.
+ENV GOTENBERG_VERSIONS_DIR_PATH=/opt/gotenberg/versions
+
+COPY --link build/capture-version.sh /opt/gotenberg/capture-version.sh
+
+RUN bash /opt/gotenberg/capture-version.sh "$GOTENBERG_VERSIONS_DIR_PATH" qpdf "$QPDF_BIN_PATH" --version \
+    && bash /opt/gotenberg/capture-version.sh "$GOTENBERG_VERSIONS_DIR_PATH" exiftool "$EXIFTOOL_BIN_PATH" -ver \
+    && bash /opt/gotenberg/capture-version.sh "$GOTENBERG_VERSIONS_DIR_PATH" pdftk "$PDFTK_BIN_PATH" --version \
+    && bash /opt/gotenberg/capture-version.sh "$GOTENBERG_VERSIONS_DIR_PATH" pdfcpu "$PDFCPU_BIN_PATH" version
+
+# OpenTelemetry defaults (noop - no telemetry overhead unless explicitly enabled).
+ENV OTEL_TRACES_EXPORTER=none
+ENV OTEL_METRICS_EXPORTER=none
+ENV OTEL_LOGS_EXPORTER=none
+
+# ----------------------------------------------
+# Final stage: full (Chromium + LibreOffice)
+# ----------------------------------------------
+FROM common-stage AS gotenberg
+
+ARG GOTENBERG_VERSION=snapshot
+ARG GOTENBERG_USER_GID=1001
+ARG GOTENBERG_USER_UID=1001
+ARG TMP_CHROMIUM_VERSION_PPC64EL="146.0.7680.80-1~deb13u1"
+
+LABEL org.opencontainers.image.title="Gotenberg" \
+    org.opencontainers.image.description="A Docker-based API for converting documents to PDF." \
+    org.opencontainers.image.version="$GOTENBERG_VERSION" \
+    org.opencontainers.image.authors="Julien Neuhart <neuhart.julien@gmail.com>" \
+    org.opencontainers.image.documentation="https://gotenberg.dev" \
+    org.opencontainers.image.source="https://github.com/gotenberg/gotenberg"
+
+# Install Chromium.
+# On ppc64el, the latest Chromium is broken, so we pin a known working
+# version from snapshot.debian.org via debsnap.
+RUN /bin/bash -c \
+    'set -e &&\
+    if [[ "$(dpkg --print-architecture)" == "ppc64el" ]]; then \
+      apt-get update -qq &&\
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends devscripts &&\
+      debsnap chromium-common "$TMP_CHROMIUM_VERSION_PPC64EL" -v --force --binary --architecture ppc64el &&\
+      debsnap chromium "$TMP_CHROMIUM_VERSION_PPC64EL" -v --force --binary --architecture ppc64el &&\
+      DEBIAN_FRONTEND=noninteractive apt-get install --fix-broken -y -qq --no-install-recommends "./binary-chromium-common/chromium-common_${TMP_CHROMIUM_VERSION_PPC64EL}_ppc64el.deb" "./binary-chromium/chromium_${TMP_CHROMIUM_VERSION_PPC64EL}_ppc64el.deb" &&\
+      DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq devscripts &&\
+      rm -rf ./binary-chromium-common/* ./binary-chromium/*; \
+    else \
+      apt-get update -qq &&\
+      apt-get upgrade -yqq &&\
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends chromium; \
+    fi' \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# Install LibreOffice & unoconverter.
+RUN echo "deb http://deb.debian.org/debian trixie-backports main" >> /etc/apt/sources.list \
+    && apt-get update -qq \
+    && apt-get upgrade -yqq \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        python3 python3-distutils-extra \
+        # Install Hyphenation for LibreOffice.
+        # Credits: https://wiki.archlinux.org/title/LibreOffice.
+        hyphen-af hyphen-as hyphen-be hyphen-bg hyphen-bn hyphen-ca hyphen-cs hyphen-da hyphen-de hyphen-el \
+        hyphen-en-gb hyphen-en-us hyphen-eo hyphen-es hyphen-fr hyphen-gl hyphen-gu hyphen-hi hyphen-hr hyphen-hu \
+        hyphen-id hyphen-is hyphen-it hyphen-kn hyphen-lt hyphen-lv hyphen-ml hyphen-mn hyphen-mr hyphen-nl \
+        hyphen-no hyphen-or hyphen-pa hyphen-pl hyphen-pt-br hyphen-pt-pt hyphen-ro hyphen-ru hyphen-sk hyphen-sl \
+        hyphen-sr hyphen-sv hyphen-ta hyphen-te hyphen-th hyphen-uk hyphen-zu \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends -t trixie-backports \
+        libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw libreoffice-math python3-uno \
+    # unoconverter will look for the Python binary, which has to be at version 3.
+    && ln -s /usr/bin/python3 /usr/bin/python \
+    # Cleanup.
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# COPY instructions last to maximize cache reuse.
+
+# Copy the Gotenberg binary (full variant with all modules).
+COPY --link --from=gotenberg-binary-stage /home/gotenberg /usr/bin/
+
+# Copy unoconverter.
+COPY --link --from=downloader-stage /downloads/unoconverter /usr/bin/unoconverter
+
+# Copy dictionnaries so that hyphens work on Chromium.
+# See https://github.com/gotenberg/gotenberg/issues/1293.
+COPY --link --chown="$GOTENBERG_USER_UID:$GOTENBERG_USER_GID" build/chromium-hyphen-data /opt/gotenberg/chromium-hyphen-data
+
+ENV CHROMIUM_BIN_PATH=/usr/bin/chromium
+ENV CHROMIUM_HYPHEN_DATA_DIR_PATH=/opt/gotenberg/chromium-hyphen-data
+ENV LIBREOFFICE_BIN_PATH=/usr/lib/libreoffice/program/soffice.bin
+ENV UNOCONVERTER_BIN_PATH=/usr/bin/unoconverter
+
+# Capture Chromium and LibreOffice versions now that both are installed.
+RUN bash /opt/gotenberg/capture-version.sh "$GOTENBERG_VERSIONS_DIR_PATH" chromium "$CHROMIUM_BIN_PATH" --version \
+    && bash /opt/gotenberg/capture-version.sh "$GOTENBERG_VERSIONS_DIR_PATH" libreoffice-api "$LIBREOFFICE_BIN_PATH" --version
 
 USER gotenberg
 WORKDIR /home/gotenberg
@@ -285,3 +307,240 @@ EXPOSE 3000
 
 ENTRYPOINT [ "/usr/bin/tini", "--" ]
 CMD [ "gotenberg" ]
+
+# ----------------------------------------------
+# Final stage: Chromium only
+# ----------------------------------------------
+FROM common-stage AS gotenberg-chromium
+
+ARG GOTENBERG_VERSION=snapshot
+ARG GOTENBERG_USER_GID=1001
+ARG GOTENBERG_USER_UID=1001
+ARG TMP_CHROMIUM_VERSION_PPC64EL="146.0.7680.80-1~deb13u1"
+
+LABEL org.opencontainers.image.title="Gotenberg (Chromium)" \
+    org.opencontainers.image.description="A Docker-based API for converting documents to PDF — Chromium variant." \
+    org.opencontainers.image.version="$GOTENBERG_VERSION" \
+    org.opencontainers.image.authors="Julien Neuhart <neuhart.julien@gmail.com>" \
+    org.opencontainers.image.documentation="https://gotenberg.dev" \
+    org.opencontainers.image.source="https://github.com/gotenberg/gotenberg"
+
+# Install Chromium.
+# On ppc64el, the latest Chromium is broken, so we pin a known working
+# version from snapshot.debian.org via debsnap.
+RUN /bin/bash -c \
+    'set -e &&\
+    if [[ "$(dpkg --print-architecture)" == "ppc64el" ]]; then \
+      apt-get update -qq &&\
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends devscripts &&\
+      debsnap chromium-common "$TMP_CHROMIUM_VERSION_PPC64EL" -v --force --binary --architecture ppc64el &&\
+      debsnap chromium "$TMP_CHROMIUM_VERSION_PPC64EL" -v --force --binary --architecture ppc64el &&\
+      DEBIAN_FRONTEND=noninteractive apt-get install --fix-broken -y -qq --no-install-recommends "./binary-chromium-common/chromium-common_${TMP_CHROMIUM_VERSION_PPC64EL}_ppc64el.deb" "./binary-chromium/chromium_${TMP_CHROMIUM_VERSION_PPC64EL}_ppc64el.deb" &&\
+      DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq devscripts &&\
+      rm -rf ./binary-chromium-common/* ./binary-chromium/*; \
+    else \
+      apt-get update -qq &&\
+      apt-get upgrade -yqq &&\
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends chromium; \
+    fi' \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# COPY instructions last to maximize cache reuse.
+
+# Copy the Gotenberg binary (Chromium variant, no LibreOffice modules).
+COPY --link --from=gotenberg-binary-stage /home/gotenberg-chromium /usr/bin/gotenberg
+
+# Copy dictionnaries so that hyphens work on Chromium.
+# See https://github.com/gotenberg/gotenberg/issues/1293.
+COPY --link --chown="$GOTENBERG_USER_UID:$GOTENBERG_USER_GID" build/chromium-hyphen-data /opt/gotenberg/chromium-hyphen-data
+
+ENV CHROMIUM_BIN_PATH=/usr/bin/chromium
+ENV CHROMIUM_HYPHEN_DATA_DIR_PATH=/opt/gotenberg/chromium-hyphen-data
+# No LibreOffice in this variant; override the default to use all available engines.
+ENV PDFENGINES_CONVERT_ENGINES=
+
+# Capture the Chromium version now that it is installed.
+RUN bash /opt/gotenberg/capture-version.sh "$GOTENBERG_VERSIONS_DIR_PATH" chromium "$CHROMIUM_BIN_PATH" --version
+
+USER gotenberg
+WORKDIR /home/gotenberg
+
+# Default API port.
+EXPOSE 3000
+
+ENTRYPOINT [ "/usr/bin/tini", "--" ]
+CMD [ "gotenberg" ]
+
+# ----------------------------------------------
+# Final stage: LibreOffice only
+# ----------------------------------------------
+FROM common-stage AS gotenberg-libreoffice
+
+ARG GOTENBERG_VERSION=snapshot
+
+LABEL org.opencontainers.image.title="Gotenberg (LibreOffice)" \
+    org.opencontainers.image.description="A Docker-based API for converting documents to PDF — LibreOffice variant." \
+    org.opencontainers.image.version="$GOTENBERG_VERSION" \
+    org.opencontainers.image.authors="Julien Neuhart <neuhart.julien@gmail.com>" \
+    org.opencontainers.image.documentation="https://gotenberg.dev" \
+    org.opencontainers.image.source="https://github.com/gotenberg/gotenberg"
+
+# Install LibreOffice & unoconverter.
+RUN echo "deb http://deb.debian.org/debian trixie-backports main" >> /etc/apt/sources.list \
+    && apt-get update -qq \
+    && apt-get upgrade -yqq \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        python3 python3-distutils-extra \
+        # Install Hyphenation for LibreOffice.
+        # Credits: https://wiki.archlinux.org/title/LibreOffice.
+        hyphen-af hyphen-as hyphen-be hyphen-bg hyphen-bn hyphen-ca hyphen-cs hyphen-da hyphen-de hyphen-el \
+        hyphen-en-gb hyphen-en-us hyphen-eo hyphen-es hyphen-fr hyphen-gl hyphen-gu hyphen-hi hyphen-hr hyphen-hu \
+        hyphen-id hyphen-is hyphen-it hyphen-kn hyphen-lt hyphen-lv hyphen-ml hyphen-mn hyphen-mr hyphen-nl \
+        hyphen-no hyphen-or hyphen-pa hyphen-pl hyphen-pt-br hyphen-pt-pt hyphen-ro hyphen-ru hyphen-sk hyphen-sl \
+        hyphen-sr hyphen-sv hyphen-ta hyphen-te hyphen-th hyphen-uk hyphen-zu \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends -t trixie-backports \
+        libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw libreoffice-math python3-uno \
+    # unoconverter will look for the Python binary, which has to be at version 3.
+    && ln -s /usr/bin/python3 /usr/bin/python \
+    # Cleanup.
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# COPY instructions last to maximize cache reuse.
+
+# Copy the Gotenberg binary (LibreOffice variant, no Chromium modules).
+COPY --link --from=gotenberg-binary-stage /home/gotenberg-libreoffice /usr/bin/gotenberg
+
+# Copy unoconverter.
+COPY --link --from=downloader-stage /downloads/unoconverter /usr/bin/unoconverter
+
+ENV LIBREOFFICE_BIN_PATH=/usr/lib/libreoffice/program/soffice.bin
+ENV UNOCONVERTER_BIN_PATH=/usr/bin/unoconverter
+
+# Capture the LibreOffice version now that it is installed.
+RUN bash /opt/gotenberg/capture-version.sh "$GOTENBERG_VERSIONS_DIR_PATH" libreoffice-api "$LIBREOFFICE_BIN_PATH" --version
+
+USER gotenberg
+WORKDIR /home/gotenberg
+
+# Default API port.
+EXPOSE 3000
+
+ENTRYPOINT [ "/usr/bin/tini", "--" ]
+CMD [ "gotenberg" ]
+
+# ==============================================================
+# Cloud Run variants
+# ==============================================================
+
+# ----------------------------------------------
+# Cloud Run: full (Chromium + LibreOffice)
+# ----------------------------------------------
+FROM gotenberg AS gotenberg-cloudrun
+
+USER root
+
+# For security reasons, the non-root user gotenberg does not own the Tini binary by default.
+# However, some providers like Cloud Run from Google Cloud cannot start a Docker container in that case.
+# See https://github.com/gotenberg/gotenberg/issues/90#issuecomment-543551353.
+RUN chown gotenberg: /usr/bin/tini
+
+ENV API_PORT_FROM_ENV=PORT
+ENV CHROMIUM_AUTO_START=true
+ENV LIBREOFFICE_AUTO_START=true
+ENV WEBHOOK_ENABLE_SYNC_MODE=true
+ENV GOTENBERG_BUILD_DEBUG_DATA=false
+ENV LOG_STD_ENABLE_GCP_FIELDS=true
+
+USER gotenberg
+
+# ----------------------------------------------
+# Cloud Run: Chromium only
+# ----------------------------------------------
+FROM gotenberg-chromium AS gotenberg-cloudrun-chromium
+
+USER root
+
+RUN chown gotenberg: /usr/bin/tini
+
+ENV API_PORT_FROM_ENV=PORT
+ENV CHROMIUM_AUTO_START=true
+ENV WEBHOOK_ENABLE_SYNC_MODE=true
+ENV GOTENBERG_BUILD_DEBUG_DATA=false
+ENV LOG_STD_ENABLE_GCP_FIELDS=true
+
+USER gotenberg
+
+# ----------------------------------------------
+# Cloud Run: LibreOffice only
+# ----------------------------------------------
+FROM gotenberg-libreoffice AS gotenberg-cloudrun-libreoffice
+
+USER root
+
+RUN chown gotenberg: /usr/bin/tini
+
+ENV API_PORT_FROM_ENV=PORT
+ENV LIBREOFFICE_AUTO_START=true
+ENV WEBHOOK_ENABLE_SYNC_MODE=true
+ENV GOTENBERG_BUILD_DEBUG_DATA=false
+ENV LOG_STD_ENABLE_GCP_FIELDS=true
+
+USER gotenberg
+
+# ==============================================================
+# AWS Lambda variants
+# ==============================================================
+
+# ----------------------------------------------
+# AWS Lambda: full (Chromium + LibreOffice)
+# ----------------------------------------------
+FROM gotenberg AS gotenberg-aws-lambda
+
+USER root
+
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.0.1 /lambda-adapter /opt/extensions/lambda-adapter
+
+ENV AWS_LWA_PORT=3000
+ENV AWS_LWA_READINESS_CHECK_PATH=/health
+ENV AWS_LWA_INVOKE_MODE=buffered
+ENV API_PORT_FROM_ENV=AWS_LWA_PORT
+ENV WEBHOOK_ENABLE_SYNC_MODE=true
+ENV GOTENBERG_BUILD_DEBUG_DATA=false
+
+USER gotenberg
+
+# ----------------------------------------------
+# AWS Lambda: Chromium only
+# ----------------------------------------------
+FROM gotenberg-chromium AS gotenberg-aws-lambda-chromium
+
+USER root
+
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.0.1 /lambda-adapter /opt/extensions/lambda-adapter
+
+ENV AWS_LWA_PORT=3000
+ENV AWS_LWA_READINESS_CHECK_PATH=/health
+ENV AWS_LWA_INVOKE_MODE=buffered
+ENV API_PORT_FROM_ENV=AWS_LWA_PORT
+ENV WEBHOOK_ENABLE_SYNC_MODE=true
+ENV GOTENBERG_BUILD_DEBUG_DATA=false
+
+USER gotenberg
+
+# ----------------------------------------------
+# AWS Lambda: LibreOffice only
+# ----------------------------------------------
+FROM gotenberg-libreoffice AS gotenberg-aws-lambda-libreoffice
+
+USER root
+
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.0.1 /lambda-adapter /opt/extensions/lambda-adapter
+
+ENV AWS_LWA_PORT=3000
+ENV AWS_LWA_READINESS_CHECK_PATH=/health
+ENV AWS_LWA_INVOKE_MODE=buffered
+ENV API_PORT_FROM_ENV=AWS_LWA_PORT
+ENV WEBHOOK_ENABLE_SYNC_MODE=true
+ENV GOTENBERG_BUILD_DEBUG_DATA=false
+
+USER gotenberg
