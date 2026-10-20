@@ -16,6 +16,9 @@ jobs:
 
     environment: dev
 
+    env:
+      IMAGE: ${{ secrets.DOCKER_REGISTRY }}/${{ secrets.DOCKER_REPOSITORY}}:${{ github.run_number }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -26,11 +29,17 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      # The Dockerfile's last stage is a LibreOffice-only variant, so the target must be explicit.
+      - name: Build and push image
+        run: |
+          az acr login --name ${{ secrets.ACR_NAME }}
+          docker build --target gotenberg -t "$IMAGE" -f Dockerfile .
+          docker push "$IMAGE"
+
       - name: Deploy to Container App
         uses: azure/container-apps-deploy-action@v2
         with:
-          appSourcePath: ${{ github.workspace }}
           acrName: ${{ secrets.ACR_NAME }}
-          imageToBuild: ${{ secrets.DOCKER_REGISTRY }}/${{ secrets.DOCKER_REPOSITORY}}:${{ github.run_number }}
+          imageToDeploy: ${{ env.IMAGE }}
           containerAppName: ${{ secrets.CONTAINER_APP_NAME }}
           resourceGroup: ${{ secrets.RESOURCE_GROUP }}
